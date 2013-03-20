@@ -1,0 +1,193 @@
+#!/usr/bin/perl
+#
+use strict;
+use warnings;
+use DBI;
+use POSIX;
+use AppConfig qw(:expand :argcount);
+use threads;
+use threads::shared;
+use Net::Ping;
+
+ 
+# make "mydaemon.log" file in /var/log/ with "chown root:adm mydaemon"
+
+my $config = AppConfig->new("dbHost"       => {ARGCOUNT => ARGCOUNT_ONE},
+                            "dbName"  => {ARGCOUNT => ARGCOUNT_ONE},
+                            "dbUser"    => {ARGCOUNT => ARGCOUNT_ONE},
+                            "dbPass"=> {ARGCOUNT => ARGCOUNT_ONE},
+                            "threadNumber"=> {ARGCOUNT => ARGCOUNT_ONE},
+							"pidPath"	=> {ARGCOUNT => ARGCOUNT_ONE},
+							"logPath"	=> {ARGCOUNT => ARGCOUNT_ONE},
+							"logging"	=> {ARGCOUNT => ARGCOUNT_ONE},
+							"apikey"	=> {ARGCOUNT => ARGCOUNT_ONE},
+							"periodReport" => {ARGCOUNT => ARGCOUNT_ONE}
+							);
+ 
+#Lecture du fichier de configuration
+$config->file('/etc/spms/spms.conf');
+ 
+# TODO: change "mydaemon" to the exact name of your daemon.
+my $daemonName    = "spms";
+#
+my $dieNow        = 0;                                     # used for "infinte loop" construct - allows daemon mode to gracefully exit
+my $sleepMainLoop = 3;                                    # number of seconds to wait between "do something" execution after queue is clear
+my $logging = $config->logging();                                  # 1= logging is on
+my $dbHost = $config->dbHost();                       
+my $dbName = $config->dbName();
+my $dbUser = $config->dbUser();
+my $dbPass = $config->dbPass();
+my $dsn = "DBI:mysql:database=$dbName;host=$dbHost";
+my $theardNumber = $config->threadNumber();
+my $pidPath = $config->pidPath();
+my $pidfile = $pidPath.$daemonName.'.pid';
+my $logPath = $config->logPath();
+my $logFile = $logPath.$daemonName.'.log';
+my $periodRep = $config->periodReport();
+
+sub logEntry;
+sub signalHandler;
+sub pingU;
+sub hostCheck;
+sub genReport;
+sub main; 
+sub mainThread;
+ 
+
+
+ 
+
+# catch signals and end the program if one is caught.
+sub signalHandler {
+    $dieNow = 1;    # this will cause the "infinite loop" to exit
+}
+
+sub pingU($$$$){
+	my $hid =$_[0];
+	my $hpid=$_[3];
+	my $ha=$_[1];
+	my $dbh=$_[2];
+	my $p = Net::Ping->new("icmp");
+	if ($p->ping($ha,3))
+	{
+		my $requetep = "UPDATE `Host` SET `host_status`='1' WHERE `id`=".$hid;
+		my $sthp = $dbh->prepare($requetep);
+		$sthp->execute();
+		$sthp -> finish;
+	}
+	else{
+		if ($hpid != -1){
+			my $requetep = "SELECT `host_status` FROM `Host` WHERE `id`=".$hpid;
+			my $sthp = $dbh->prepare($requetep);
+			$sthp->execute();
+			my ($pst)= $sthp->fetchrow_array;
+			if($pst == 1){
+				my $requetep = "UPDATE `Host` SET `host_status`='0' WHERE `id`=".$hid;
+				my $sthp = $dbh->prepare($requetep);
+				$sthp->execute();
+			}else{
+				my $requetep = "UPDATE `Host` SET `host_status`='2' WHERE `id`=".$hid;
+				my $sthp = $dbh->prepare($requetep);
+				$sthp->execute();
+			}
+			$sthp->finish();
+			}
+		else{
+			my $requetep = "UPDATE `Host` SET `host_status`='0' WHERE `id`=".$hid;
+			my $sthp = $dbh->prepare($requetep);
+			$sthp->execute();
+			$sthp->finish();
+		}
+		
+	}
+	undef $p;
+	
+}
+
+sub hostCheck($$){
+#Connexion a la base
+		my $ind = $_[0];
+		my $nbst = $_[1];
+        my $dbh = DBI->connect($dsn, $dbUser, $dbPass) or die "Echec connexion";
+		my $requete = "SELECT `id`,`parent_host`,`host_address` FROM `Host` WHERE `host_address` IS NOT NULL AND `host_status`!='3' ORDER BY `id` ASC LIMIT $ind , $nbst ";
+        my $sth = $dbh->prepare($requete);
+        $sth->execute();
+		while ( my ($hid,$hpd,$ha) = $sth->fetchrow_array ){
+		if(!(defined $hpd)){
+			$hpd= -1;
+			pingU($hid,$ha,$dbh,$hpd);
+		}else{
+			pingU($hid,$ha,$dbh,$hpd);
+		}
+		}
+		#deconnexions de la base
+        $sth -> finish;
+        $dbh -> disconnect;
+
+		#vidage forcée
+		undef $dbh;
+		undef $requete;
+		undef $sth;
+		return 0;
+}
+ 
+sub mainThread($){
+	my $i = $_[0];
+	until ($dieNow) {
+			#Get number of site and spread them into diffrent thread
+			my $dbh = DBI->connect($dsn, $dbUser, $dbPass) or die "Echec connexion";
+			my $requete = "SELECT COUNT(*) FROM `Host` WHERE `host_address` IS NOT NULL AND `host_status`!='3' ORDER BY parent_host ASC";
+			my $sth = $dbh->prepare($requete);
+			$sth->execute();
+			
+			#useful variable to spread data treatment in different thread
+			my $nb_site = $sth->fetchrow_array;
+			$sth -> finish;
+			$dbh -> disconnect;
+			undef $sth;
+			undef $dbh;
+			undef $requete;
+			my $nb_site_p_thread = int($nb_site / $theardNumber)+1;
+			my $depart = $i * $nb_site_p_thread;
+			hostCheck($depart,$nb_site_p_thread);
+			undef $depart;
+			sleep(2);
+			}
+			
+
+		
+}	
+ 
+sub genReport{
+			my $dbh = DBI->connect($dsn, $dbUser, $dbPass) or die "Echec connexion";
+			my $requete = "INSERT INTO `Data_Report` (id, host_id,host_type,host_group,report_date,status) SELECT NULL,id,host_type,host_group,NOW(),host_status FROM `Host`";
+			my $sth = $dbh->prepare($requete);
+			$sth->execute();
+			$sth -> finish;
+			$dbh -> disconnect;
+			
+} 
+ 
+
+sub main{
+	my $i = 0;
+	while ($i<$theardNumber){
+		threads->create(\&mainThread,$i)->detach;
+		$i++;
+	}
+	$i= 0;
+	until ($dieNow){
+		if ( $i ==  $periodRep ){
+			genReport;
+			$i=0;
+		}
+		else{
+			sleep(60);
+			$i++;
+		}
+	}
+	
+
+}
+
+main;
